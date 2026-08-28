@@ -35,6 +35,21 @@ QtObject {
   readonly property int maxVaults: 50
   readonly property int maxPreviewChars: 16 * 1024
 
+  // Producer-side ceilings. The daemon bounds what it reads, but a bound that
+  // only exists at the far end still lets this process build the oversized
+  // string first — JSON.stringify on a pasted novel allocates it here, inside
+  // the shell, before a single byte is written. So the values are cut, or the
+  // request refused, before anything is serialised.
+  //
+  // maxCaptureChars is a quarter of the daemon's byte ceiling because UTF-8
+  // can spend four bytes on one character, so this holds even in the worst
+  // case rather than only for ASCII.
+  readonly property int maxQueryChars: 200
+  readonly property int maxTitleChars: 200
+  readonly property int maxPathChars: 4096
+  readonly property int maxCaptureChars: 64 * 1024
+  readonly property int commandCeiling: 256 * 1024
+
   // ----------------------------------------------------------------- status
   property string vault: ""
   property string vaultName: ""
@@ -123,7 +138,10 @@ QtObject {
 
   function send(payload) {
     if (!root.daemon.running) return false
-    root.daemon.write(JSON.stringify(payload) + "\n")
+    var line = JSON.stringify(payload)
+    // The last guard, at the writer, for anything a caller failed to cut.
+    if (line.length > root.commandCeiling) return false
+    root.daemon.write(line + "\n")
     return true
   }
 
@@ -131,7 +149,8 @@ QtObject {
     root.latestSearchId = root.newId()
     root.searching = true
     if (!root.send({ c: "search", id: root.latestSearchId,
-                     q: String(query || ""), limit: root.maxResults })) {
+                     q: String(query || "").slice(0, root.maxQueryChars),
+                     limit: root.maxResults })) {
       root.searching = false
     }
   }
@@ -140,12 +159,12 @@ QtObject {
     if (!root.showPreview) return
     root.latestPreviewId = root.newId()
     root.previewLoading = true
-    root.previewPath = String(relPath || "")
+    root.previewPath = String(relPath || "").slice(0, root.maxPathChars)
     root.send({ c: "preview", id: root.latestPreviewId, p: root.previewPath })
   }
 
   function recordOpen(relPath) {
-    root.send({ c: "open", p: String(relPath || "") })
+    root.send({ c: "open", p: String(relPath || "").slice(0, root.maxPathChars) })
   }
 
   // The mode is always explicit now: there are two Save buttons and each says
@@ -153,9 +172,19 @@ QtObject {
   // what the panel appears to be about to do.
   function capture(text, title, mode) {
     if (mode !== "new" && mode !== "daily") return
+    var body = String(text || "")
+    // Refused rather than cut. Truncating a note silently throws away
+    // somebody's writing, which is the one thing a capture tool must never do.
+    if (body.length > root.maxCaptureChars) {
+      root.captureError = "That note is too long to capture — "
+        + body.length + " characters, the limit is " + root.maxCaptureChars + "."
+      root.lastCapture = ""
+      return
+    }
     root.captureError = ""
-    root.send({ c: "capture", id: root.newId(), text: String(text || ""),
-                title: String(title || ""), mode: mode })
+    root.send({ c: "capture", id: root.newId(), text: body,
+                title: String(title || "").slice(0, root.maxTitleChars),
+                mode: mode })
   }
 
   // Counts always. Asking only when the switcher opened made the numbers
@@ -444,7 +473,7 @@ QtObject {
     if (root.daemonEverStarted) {
       root.results = []
       root.indexed = false
-      root.send({ c: "vault", p: root.vaultPath })
+      root.send({ c: "vault", p: root.vaultPath.slice(0, root.maxPathChars) })
     }
   }
 

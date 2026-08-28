@@ -190,6 +190,79 @@ def ensure_state_dir():
     return dir_is_owned(STATE_DIR)
 
 
+# ------------------------------------------------------------- bounded input
+
+class BoundedLineReader(object):
+    """Newline-delimited records, bounded where the bytes enter.
+
+    sys.stdin.readline() buffers a whole record before anything can measure it,
+    so a ceiling checked on the returned string has already been paid for — the
+    allocation happened inside readline. That is the same reasoning the outbound
+    side already applies at emit(): a stream cannot be bounded by its reader.
+
+    This accumulates at most `ceiling` bytes. Once a record exceeds that, the
+    buffer is dropped and the reader discards bytes until the terminating
+    newline, so the over-long record costs one chunk of memory rather than its
+    own length, and the stream stays in sync for whatever follows it.
+    """
+
+    CHUNK = 64 * 1024
+
+    def __init__(self, stream, ceiling):
+        self.fd = stream.fileno()
+        self.ceiling = ceiling
+        self.buf = bytearray()
+        self.discarding = False
+
+    def fileno(self):
+        return self.fd
+
+    def read(self):
+        """Return a list of complete records, or None at end of stream.
+
+        A refused record appears in the list as None, so the caller can report
+        it without ever having held it.
+        """
+        try:
+            chunk = os.read(self.fd, self.CHUNK)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+
+        records = []
+        start = 0
+        while start < len(chunk):
+            newline = chunk.find(b"\n", start)
+            if newline < 0:
+                piece = chunk[start:]
+                if not self.discarding:
+                    if len(self.buf) + len(piece) > self.ceiling:
+                        self.buf = bytearray()
+                        self.discarding = True
+                        records.append(None)
+                    else:
+                        self.buf.extend(piece)
+                break
+
+            piece = chunk[start:newline]
+            if self.discarding:
+                # The over-long record ends here; it was refused when it
+                # crossed the ceiling and none of it was kept.
+                self.discarding = False
+                self.buf = bytearray()
+            elif len(self.buf) + len(piece) > self.ceiling:
+                self.buf = bytearray()
+                records.append(None)
+            else:
+                self.buf.extend(piece)
+                records.append(bytes(self.buf))
+                self.buf = bytearray()
+            start = newline + 1
+
+        return records
+
+
 # ------------------------------------------------------------------ output
 
 def emit(payload):
@@ -997,24 +1070,30 @@ def main():
     emit(status(index, mode))
 
     import select
+    reader = BoundedLineReader(sys.stdin, MAX_COMMAND_BYTES)
+    pending = []
     while True:
-        interval = ACTIVE_RESCAN if mode == "active" else IDLE_RESCAN
-        ready, _, _ = select.select([sys.stdin], [], [], interval)
-        if not ready:
-            before = len(index.notes)
-            index.scan()
-            if len(index.notes) != before:
-                emit(status(index, mode))
+        if not pending:
+            interval = ACTIVE_RESCAN if mode == "active" else IDLE_RESCAN
+            ready, _, _ = select.select([reader], [], [], interval)
+            if not ready:
+                before = len(index.notes)
+                index.scan()
+                if len(index.notes) != before:
+                    emit(status(index, mode))
+                continue
+            records = reader.read()
+            if records is None:
+                return 0
+            pending.extend(records)
             continue
 
-        line = sys.stdin.readline()
-        if not line:
-            return 0
-        if len(line) > MAX_COMMAND_BYTES:
-            emit({"t": "error", "msg": "command exceeded the ceiling"})
+        record = pending.pop(0)
+        if record is None:
+            emit({"t": "error", "msg": "command exceeded the ceiling and was discarded"})
             continue
         try:
-            command = json.loads(line)
+            command = json.loads(record.decode("utf-8", "replace"))
         except ValueError:
             continue
         if not isinstance(command, dict):
