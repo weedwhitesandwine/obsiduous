@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.weedwhitesandwine.obsiduous",
+  "name": "Obsiduous",
+  "version": "0.1.0",
+  "author": "weedwhitesandwine",
+  "license": "MIT",
+  "description": "Your whole Obsidian vault, in the bar, answered from memory.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Obsiduous",
+    "description": "Your whole Obsidian vault, in the bar, answered from memory.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
